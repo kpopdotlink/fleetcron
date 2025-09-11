@@ -1,0 +1,17 @@
+{
+  "mongodb_uri": "mongodb://localhost:27017",
+  "db_name": "fleetcron",
+  "tz": "Asia/Seoul",
+  "http_defaults": {
+    "timeout_sec": 30,
+    "retry": {
+      "retries": 3,
+      "delay_sec": 1,
+      "backoff": 2.0
+    }
+  },
+  "secrets": {
+    "API_KEY": "your-api-key-here",
+    "SECRET_TOKEN": "your-secret-token-here"
+  }
+}
