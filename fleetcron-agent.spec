@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['agent_fixed.py'],
+    ['agent.py'],
     pathex=[],
     binaries=[],
     datas=[('/opt/anaconda3/lib/python3.12/site-packages/certifi/cacert.pem', 'certifi')],

@@ -226,7 +226,7 @@ if hasattr(local_now, 'utcoffset') and local_now.utcoffset():
 print("=" * 30 + "\n")
 
 MAX_SERIAL = int(CFG.get("max_serial", 10))
-OFFSET_STEP_SEC = 10  # 5초에서 10초로 변경
+OFFSET_STEP_SEC = 5  # 원래대로 5초 간격
 RESP_SAMPLE_MAX = 2000
 
 # -------------------- 파일 락(한 PC 1프로세스) --------------------
@@ -440,30 +440,43 @@ def update_heartbeat(db, machine_id: str, scheduled_minute_utc: datetime):
     db.machines.update_one({"machine_id": machine_id},
         {"$set": {"last_online_minute": scheduled_minute_utc, "last_seen": now}})
 
-def get_my_order(db, my_serial: int, machine_id: str, scheduled_minute_utc: datetime) -> int:
-    update_heartbeat(db, machine_id, scheduled_minute_utc)
-    
-    # 다른 머신들의 heartbeat를 기다림 (레이스 컨디션 방지)
-    if my_serial > 1:
-        time.sleep(2)
-    
-    machines = list(db.machines.find(
-        {"last_online_minute": scheduled_minute_utc},
+def get_my_fixed_order(db, my_serial: int, machine_id: str) -> int:
+    """전체 머신 중 나의 고정 순번을 반환 (serial + machine_id 정렬)"""
+    # 모든 머신을 serial, machine_id 순으로 정렬
+    all_machines = list(db.machines.find(
+        {},
         {"serial": 1, "machine_id": 1}
     ).sort([("serial", 1), ("machine_id", 1)]))
     
-    for idx, m in enumerate(machines, 1):
+    # 내 순번 찾기
+    for idx, m in enumerate(all_machines, 1):
         if m["machine_id"] == machine_id:
             return idx
-    return 1
+    
+    # 못 찾으면 serial 값을 기본으로 사용
+    return my_serial
 
-def has_earlier_online(db, my_serial: int, scheduled_minute_utc: datetime) -> bool:
-    if my_serial <= 1: return False
-    exists = db.machines.find_one({
-        "serial": {"$lt": my_serial},
-        "last_online_minute": scheduled_minute_utc
-    })
-    return exists is not None
+def check_earlier_machines_online(db, my_order: int, machine_id: str, scheduled_minute_utc: datetime) -> bool:
+    """내 앞 순번 머신들이 이번 분에 온라인인지 확인"""
+    if my_order <= 1:
+        return False
+    
+    # 모든 머신을 순서대로 가져옴
+    all_machines = list(db.machines.find(
+        {},
+        {"serial": 1, "machine_id": 1, "last_online_minute": 1}
+    ).sort([("serial", 1), ("machine_id", 1)]))
+    
+    # 내 앞 순번들 확인 (1부터 my_order-1까지)
+    for idx, m in enumerate(all_machines, 1):
+        if idx >= my_order:
+            break  # 내 순번에 도달
+        
+        # 이 머신이 현재 분에 활동했는지 확인
+        if m.get("last_online_minute") == scheduled_minute_utc:
+            return True  # 앞 순번이 살아있음
+    
+    return False  # 앞 순번들이 모두 죽었거나 활동 안함
 
 # -------------------- 클레임 --------------------
 def claim_job_run(db, job, scheduled_minute_utc, machine_id, my_serial):
@@ -720,46 +733,69 @@ def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, t
     sched_minute_utc = to_utc_minute(tick_minute_local)
     
     if check_second == 0:
-        # Serial > 1은 무조건 대기 (레이스 컨디션 방지)
-        if my_serial > 1:
-            if USE_RICH:
-                console.print(f"\n[bold cyan]⏰ {tick_minute_local:%H:%M}[/bold cyan] - Serial #{my_serial}, waiting {(my_serial-1)*OFFSET_STEP_SEC}s...")
-            else:
-                print(f"\n⏰ {tick_minute_local:%H:%M} - Serial #{my_serial}, waiting {(my_serial-1)*OFFSET_STEP_SEC}s...")
-            return my_serial
+        # 1. 모든 머신이 동시에 heartbeat 업데이트 (중요!)
+        update_heartbeat(db, machine_id, sched_minute_utc)
         
-        # Serial 1만 즉시 실행 가능
-        jobs_cache.reload()
-        my_order = get_my_order(db, my_serial, machine_id, sched_minute_utc)
+        # 2. 내 고정 순번 확인 (serial + machine_id 정렬)
+        my_order = get_my_fixed_order(db, my_serial, machine_id)
         
-        if USE_RICH:
-            console.print(f"\n[bold cyan]⏰ {tick_minute_local:%H:%M}[/bold cyan] - Serial #1, Order: [yellow]#{my_order}[/yellow]")
-        else:
-            print(f"\n⏰ {tick_minute_local:%H:%M} - Serial #1, Order #{my_order}")
-        
-        if my_serial == 1 and my_order == 1:
-            pass  # 즉시 실행
-        else:
-            return my_order
-    else:
-        # 재확인 시점
-        machines = list(db.machines.find(
-            {"last_online_minute": sched_minute_utc},
-            {"serial": 1, "machine_id": 1}
+        # 모든 머신 상태 확인 (나중에 표시용)
+        all_machines = list(db.machines.find(
+            {},
+            {"serial": 1, "machine_id": 1, "last_online_minute": 1}
         ).sort([("serial", 1), ("machine_id", 1)]))
         
-        my_order = 1
-        for idx, m in enumerate(machines, 1):
-            if m["machine_id"] == machine_id:
-                my_order = idx
-                break
+        online_count = sum(1 for m in all_machines if m.get("last_online_minute") == sched_minute_utc)
+        total_count = len(all_machines)
         
-        if has_earlier_online(db, my_serial, sched_minute_utc):
+        # 3. Jobs 리로드
+        jobs_cache.reload()
+        
+        wait_seconds = (my_order - 1) * OFFSET_STEP_SEC
+        
+        if USE_RICH:
+            console.print(f"\n[bold cyan]⏰ {tick_minute_local:%H:%M}[/bold cyan] - Serial #{my_serial} (Order #{my_order}/{total_count})")
+        else:
+            print(f"\n⏰ {tick_minute_local:%H:%M} - Serial #{my_serial} (Order #{my_order}/{total_count})")
+        
+        # 4. 순번 1이면 즉시 실행, 아니면 대기
+        if my_order == 1:
+            # 바로 실행
+            pass
+        else:
+            # 카운트다운 표시하면서 대기
+            show_serial_wait_countdown(wait_seconds)
+            return (my_order, online_count, total_count)  # 튜플로 상태 정보 반환
+    
+    else:
+        # 재확인 시점 (5초, 10초, 15초...)
+        # 튜플로 전달된 경우 언패킹
+        if isinstance(check_second, tuple):
+            my_order, online_count, total_count = check_second[0], check_second[1], check_second[2]
+            check_second = (my_order - 1) * OFFSET_STEP_SEC
+        else:
+            my_order = get_my_fixed_order(db, my_serial, machine_id)
+            online_count = 0
+            total_count = 0
+        
+        if USE_RICH:
+            console.print(f"\n[bold cyan]⏰ {tick_minute_local:%H:%M}:{check_second:02d}[/bold cyan] - Checking order #{my_order}")
+        else:
+            print(f"\n⏰ {tick_minute_local:%H:%M}:{check_second:02d} - Checking order #{my_order}")
+        
+        # 내 앞 순번들이 살아있는지 확인
+        if check_earlier_machines_online(db, my_order, machine_id, sched_minute_utc):
             if USE_RICH:
-                console.print(f"[dim]Earlier machine online, skipping[/dim]")
+                console.print(f"  [dim]Earlier machine is online, skipping[/dim]")
             else:
-                print(f"Earlier machine online, skipping")
-            return
+                print(f"  Earlier machine is online, skipping")
+            return (online_count, total_count)  # 머신 상태 정보 반환
+        
+        # 앞 순번들이 모두 죽었음 - 내가 실행
+        if USE_RICH:
+            console.print(f"  [green]No earlier machines online, executing![/green]")
+        else:
+            print(f"  No earlier machines online, executing!")
 
     hh, mm = tick_minute_local.hour, tick_minute_local.minute
     jobs = jobs_cache.list_for(hh, mm)
@@ -830,8 +866,44 @@ def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, t
         db.job_runs.update_one(run_key, {"$set": {"start_at": start_utc, "end_at": end_utc, "status": status}})
         elapsed = int((end_utc - start_utc).total_seconds() * 1000)
         print_job_result(j2.get('name', 'Unknown'), status, elapsed, total_actions, successful_actions)
+    
+    # 작업 완료 후 머신 상태 반환 (재확인 시점에서 받은 정보)
+    if check_second > 0 and isinstance(check_second, tuple):
+        return (check_second[1], check_second[2])  # online_count, total_count
+    elif check_second == 0:
+        # 첫 실행 시점에서 계산한 정보가 있으면 반환
+        return (online_count, total_count)
 
 # -------------------- 예쁜 출력 함수들 --------------------
+def show_serial_wait_countdown(wait_seconds: int):
+    """시리얼 대기 시간 카운트다운 표시"""
+    if not USE_RICH:
+        print(f"  ⏳ Waiting {wait_seconds}s to check...")
+        return
+    
+    start_time = time.time()
+    with Live(console=console, refresh_per_second=2) as live:
+        while True:
+            elapsed = time.time() - start_time
+            remaining = wait_seconds - elapsed
+            
+            if remaining <= 0:
+                break
+            
+            text = Text()
+            text.append("  ⏳ Waiting to check: ", style="yellow")
+            text.append(f"{int(remaining)}s", style="bold cyan")
+            
+            # 프로그레스 바
+            progress = (elapsed / wait_seconds) * 100
+            bar_length = 30
+            filled = int(bar_length * progress / 100)
+            bar = "█" * filled + "░" * (bar_length - filled)
+            text.append(f"\n  [{bar}] {progress:.0f}%", style="green")
+            
+            live.update(text)
+            time.sleep(0.5)
+
 def show_countdown(target_time: datetime, next_job_name: str = "Next job", machine_id: str = "", hostname: str = "", serial: int = 0):
     """실시간 카운트다운 타이머 표시"""
     if not USE_RICH:
@@ -889,6 +961,60 @@ def show_countdown(target_time: datetime, next_job_name: str = "Next job", machi
             
             live.update(layout)
             time.sleep(0.5)
+
+def show_long_wait_countdown(wait_seconds: int, next_time: datetime, next_job_name: str):
+    """긴 대기 시간 동안 카운트다운과 프로그레스 바 표시"""
+    if not USE_RICH:
+        time.sleep(wait_seconds)
+        return
+    
+    start_time = time.time()
+    with Live(console=console, refresh_per_second=1) as live:
+        while True:
+            elapsed = time.time() - start_time
+            remaining = wait_seconds - elapsed
+            
+            if remaining <= 0:
+                break
+            
+            # 레이아웃 생성
+            layout = Layout()
+            layout.split_column(
+                Layout(name="status", size=3),
+                Layout(name="progress", size=5),
+                Layout(name="info", size=4)
+            )
+            
+            # 상태 표시
+            status_text = Text(justify="center")
+            status_text.append("⏸  Long Wait Mode", style="bold yellow")
+            layout["status"].update(Panel(status_text, border_style="yellow"))
+            
+            # 프로그레스 표시
+            progress_text = Text(justify="center")
+            mins, secs = divmod(int(remaining), 60)
+            progress_text.append(f"Time Remaining: ", style="white")
+            progress_text.append(f"{mins:02d}:{secs:02d}\n", style="bold cyan")
+            
+            progress = (elapsed / wait_seconds) * 100
+            bar_length = 40
+            filled = int(bar_length * progress / 100)
+            bar = "█" * filled + "░" * (bar_length - filled)
+            progress_text.append(f"\n[{bar}] {progress:.1f}%", style="green")
+            
+            layout["progress"].update(Panel(progress_text, title=f"Next Check: {next_time:%H:%M}", border_style="cyan"))
+            
+            # 정보 표시
+            info_table = Table.grid(padding=0)
+            info_table.add_column(style="cyan", justify="right")
+            info_table.add_column(style="white")
+            info_table.add_row("📋 Next Job:", f"[yellow]{next_job_name}[/yellow]")
+            info_table.add_row("⏰ Scheduled:", f"{next_time:%H:%M:%S}")
+            
+            layout["info"].update(Panel(info_table, border_style="dim"))
+            
+            live.update(layout)
+            time.sleep(1)
 
 def print_job_start(job_name: str, my_order: int, job_config: Dict[str, Any] = None):
     """작업 시작 시 상세 정보 출력"""
@@ -1059,11 +1185,18 @@ def agent_main():
         max_sleep = 30 * 60
         
         if sleep_sec > max_sleep:
+            # 다음 작업 정보 가져오기
+            next_jobs = jobs_cache.list_for(next_schedule.hour, next_schedule.minute)
+            next_job_name = next_jobs[0].get('name', 'Unknown Job') if next_jobs else 'Unknown Job'
+            
             if USE_RICH:
-                console.print(f"[dim]⏸  Long wait. Next job at {next_schedule:%H:%M} (waiting 30min)[/dim]")
+                console.print(f"[dim]⏸  Long wait. Next job at {next_schedule:%H:%M}[/dim]")
+                console.print(f"[dim]   📋 Next: {next_job_name}[/dim]")
+                # 30분 카운트다운 표시
+                show_long_wait_countdown(max_sleep, next_schedule, next_job_name)
             else:
-                print(f"⏸  Long wait. Next: {next_schedule:%H:%M} (30min)")
-            time.sleep(max_sleep)
+                print(f"⏸  Long wait. Next: {next_schedule:%H:%M} ({next_job_name})")
+                time.sleep(max_sleep)
             jobs_cache.reload()
             continue
         
@@ -1076,13 +1209,35 @@ def agent_main():
         try:
             result = process_minute(db, jobs_cache, my_serial, machine_id, next_schedule, 0)
             
-            if isinstance(result, int) and result > 1:
-                my_order = result
-                check_second = (my_order - 1) * OFFSET_STEP_SEC
-                
-                if check_second < 60:
-                    time.sleep(check_second)
-                    process_minute(db, jobs_cache, my_serial, machine_id, next_schedule, check_second)
+            # 결과가 튜플인 경우 (order, online_count, total_count)
+            if isinstance(result, tuple) and len(result) == 3:
+                my_order, online_count, total_count = result
+                if my_order > 1:
+                    check_second = (my_order - 1) * OFFSET_STEP_SEC
+                    if check_second < 60:
+                        time.sleep(check_second)
+                        final_result = process_minute(db, jobs_cache, my_serial, machine_id, next_schedule, 
+                                                    (my_order, online_count, total_count))
+                        # 작업 완료 후 머신 상태 표시
+                        if isinstance(final_result, tuple) and len(final_result) == 2:
+                            online, total = final_result
+                            if USE_RICH:
+                                console.print(f"\n[dim]🖥️  Machines at execution: {online}/{total} online[/dim]")
+                            else:
+                                print(f"\n🖥️  Machines: {online}/{total} online")
+                else:
+                    # 순번 1인 경우도 머신 상태 표시
+                    if USE_RICH:
+                        console.print(f"\n[dim]🖥️  Machines at execution: {online_count}/{total_count} online[/dim]")
+                    else:
+                        print(f"\n🖥️  Machines: {online_count}/{total_count} online")
+            elif isinstance(result, tuple) and len(result) == 2:
+                # 작업 완료 후 반환된 머신 상태
+                online_count, total_count = result
+                if USE_RICH:
+                    console.print(f"\n[dim]🖥️  Machines at execution: {online_count}/{total_count} online[/dim]")
+                else:
+                    print(f"\n🖥️  Machines: {online_count}/{total_count} online")
         except Exception as e:
             print("[loop] 오류:", e, file=sys.stderr)
             traceback.print_exc()
