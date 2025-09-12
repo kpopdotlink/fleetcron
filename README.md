@@ -10,7 +10,7 @@
 ## 🚀 Features
 
 - **Distributed Execution** - Automatic leader election using serial number assignment (1-N machines)
-- **Smart Failover** - Staggered execution with 5-second offsets to ensure job completion
+- **Smart Failover** - Staggered execution with 10-second offsets to ensure job completion
 - **Dynamic Job Management** - Hot reload jobs without restarting agents
 - **HTTP Action Chains** - Sequential execution of multiple HTTP requests with conditional logic
 - **Template System** - Secure secrets management with `{{KEY}}` variable interpolation
@@ -27,8 +27,12 @@
 ## 🔧 Installation
 
 ```bash
-# Install dependencies
-pip install pymongo requests
+# Required dependencies
+pip install pymongo requests pytz certifi
+
+# Optional but recommended
+pip install rich  # Beautiful console output
+pip install cloudscraper  # Cloudflare bypass support
 
 # For building standalone executable
 pip install pyinstaller
@@ -63,12 +67,60 @@ python agent.py
 ```
 
 ### Production (Standalone Binary)
+
+⚠️ **Important**: Must include certifi CA bundle for SSL to work properly!
+
 ```bash
-# Build
-pyinstaller --onefile --name fleetcron-agent agent.py
+# Build with SSL certificates (REQUIRED)
+pyinstaller --onefile --name fleetcron-agent \
+  --add-data "$(python -c 'import certifi; print(certifi.where())'):certifi" \
+  agent.py
+
+# Windows build
+pyinstaller --onefile --name fleetcron-agent ^
+  --add-data "path\to\certifi\cacert.pem;certifi" ^
+  agent.py
+
+# More complete build (includes timezone data)
+pyinstaller --onefile --name fleetcron-agent \
+  --add-data "$(python -c 'import certifi; print(certifi.where())'):certifi" \
+  --add-data "$(python -c 'import pytz; import os; print(os.path.dirname(pytz.__file__))'):pytz" \
+  --hidden-import pytz \
+  --hidden-import certifi \
+  agent.py
 
 # Run
 ./dist/fleetcron-agent
+```
+
+#### Alternative: Using spec file (Recommended)
+
+Create `fleetcron.spec`:
+```python
+import certifi
+import pytz
+import os
+
+a = Analysis(
+    ['agent.py'],
+    datas=[
+        (certifi.where(), 'certifi'),
+        (os.path.dirname(pytz.__file__), 'pytz'),
+    ],
+    hiddenimports=['pytz', 'certifi'],
+)
+pyz = PYZ(a.pure)
+exe = EXE(
+    pyz, a.scripts, a.binaries, a.datas, [],
+    name='fleetcron-agent',
+    debug=False,
+    console=True,
+)
+```
+
+Then build:
+```bash
+pyinstaller fleetcron.spec
 ```
 
 ## 🗄️ Database Setup
@@ -138,6 +190,21 @@ db.jobs.insertOne({
 | `headers` | object | HTTP headers with template support |
 | `retry` | object | Retry configuration |
 | `when` | object | Conditional execution rules |
+
+## 🆕 Recent Fixes (v2.0)
+
+### Major Bug Fixes
+1. **Timezone Issues**: Fixed 9-hour time difference on non-development machines
+   - Now uses pytz library for reliable timezone handling
+   - Manual UTC+9 fallback for Korea timezone
+
+2. **SSL Certificate Errors**: Resolved `CERTIFICATE_VERIFY_FAILED` errors
+   - Certifi CA bundle must be included in PyInstaller builds
+   - Automatic fallback to system CA certificates
+
+3. **Machine Coordination**: Fixed race conditions in multi-machine setups
+   - Serial > 1 machines now wait properly (10-second offset)
+   - Improved heartbeat timing to prevent simultaneous execution
 
 ## 🔄 System Commands
 
@@ -235,7 +302,7 @@ sudo systemctl start fleetcron
 1. **Scheduling**: Agent wakes at scheduled times only
 2. **Coordination**: Updates heartbeat, checks serial order
 3. **Leader Election**: Lowest available serial executes
-4. **Failover**: Higher serials wait (serial-1)*5 seconds
+4. **Failover**: Higher serials wait (serial-1)*10 seconds
 5. **Execution**: Claim job, execute actions, record results
 
 ### Database Collections

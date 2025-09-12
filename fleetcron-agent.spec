@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['agent.py'],
+    ['agent_fixed.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('/opt/anaconda3/lib/python3.12/site-packages/certifi/cacert.pem', 'certifi')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
