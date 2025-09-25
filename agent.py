@@ -73,6 +73,33 @@ if MISSING_PACKAGES:
     print(f"Please install: pip install {' '.join(MISSING_PACKAGES)}")
     sys.exit(1)
 
+# 전역 HTTP 세션 및 헬퍼
+HTTP_SESSION = requests.Session()
+NOTIFIER = None  # type: Optional["NotificationManager"]
+
+
+def safe_close_response(resp):
+    """requests/HTTP 응답 객체를 안전하게 닫는다."""
+    if resp is None:
+        return
+    close_attr = getattr(resp, "close", None)
+    if callable(close_attr):
+        try:
+            close_attr()
+        except Exception:
+            pass
+
+
+def escape_markdown_v2(text: str) -> str:
+    """텔레그램 MarkdownV2에서 필요한 이스케이프 처리"""
+    if not text:
+        return text
+    specials = r"\_*[]()~`>#+-=|{}.!"
+    text = text.replace("\\", "\\\\")
+    for ch in specials:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 # -------------------- 설정 로드 --------------------
 APP_NAME = "fleetcron-agent"
 CONFIG_BASENAME = "fleetcron.config.json"
@@ -398,8 +425,97 @@ class JobsCache:
             
             return None
 
+
+class NotificationManager:
+    """Telegram 알림 전송을 관리"""
+
+    def __init__(self, db):
+        self.db = db
+        self._lock = threading.Lock()
+        self._config: Dict[str, Any] = {}
+        self.reload()
+
+    def reload(self):
+        doc = self.db.notification_configs.find_one({"_id": "telegram"}) or {}
+        with self._lock:
+            self._config = doc
+
+    def _get_config(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._config)
+
+    def is_configured(self) -> bool:
+        cfg = self._get_config()
+        return bool(cfg.get("bot_token") and (cfg.get("chat_id") or cfg.get("chat_id_silent") or cfg.get("chat_id_alert")))
+
+    def _select_chat_id(self, cfg: Dict[str, Any], silent: bool) -> Optional[str]:
+        if silent:
+            return cfg.get("chat_id_silent") or cfg.get("chat_id")
+        return cfg.get("chat_id_alert") or cfg.get("chat_id")
+
+    def send_message(self, text: str, silent: bool = False) -> bool:
+        cfg = self._get_config()
+        token = cfg.get("bot_token")
+        if not token:
+            return False
+        chat_id = self._select_chat_id(cfg, silent)
+        if not chat_id:
+            return False
+
+        parse_mode = cfg.get("default_parse_mode")
+        payload_text = escape_markdown_v2(text) if parse_mode == "MarkdownV2" else text
+
+        payload: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": payload_text,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if silent:
+            payload["disable_notification"] = True
+
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = None
+        try:
+            resp = HTTP_SESSION.post(url, json=payload, timeout=10, verify=get_ssl_verify_path())
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"[notify] Telegram send failed: {e}", file=sys.stderr)
+            return False
+        finally:
+            safe_close_response(resp)
+
+    def notify_job_result(self, *, job_name: str, status: str, elapsed_ms: int,
+                           scheduled_local: datetime, machine_id: str, hostname: str, serial: int,
+                           steps: List[Dict[str, Any]], total_actions: int, successful_actions: int) -> None:
+        if not self.is_configured():
+            return
+
+        silent = status == "ok"
+        header = "✅ FleetCron Job Succeeded" if silent else "🚨 FleetCron Job Failed"
+        lines = [header]
+        lines.append(f"Job: {job_name}")
+        lines.append(f"Scheduled: {scheduled_local.strftime('%Y-%m-%d %H:%M (%Z)')}")
+        lines.append(f"Machine: {hostname} (serial #{serial}, id {machine_id[:8]}...)")
+        lines.append(f"Elapsed: {elapsed_ms} ms")
+        if total_actions > 0:
+            lines.append(f"Actions: {successful_actions}/{total_actions} succeeded")
+
+        if not silent:
+            failure = next((step for step in steps if step.get("status") != "ok" and step.get("status") != "skipped" and step.get("status") != "skipped_when" and step.get("status") != "skipped_unsupported"), None)
+            if not failure:
+                failure = next((step for step in steps if step.get("status") == "error"), None)
+            if failure:
+                err = failure.get("error") or failure.get("status") or "Unknown error"
+                attempts = failure.get("attempts")
+                lines.append(f"Error: {err}")
+                if attempts:
+                    lines.append(f"Attempts: {attempts}")
+
+        self.send_message("\n".join(lines), silent=silent)
 # -------------------- 명령 폴링 --------------------
-def commands_watcher(db, machine_id: str, jobs_cache: JobsCache, stop_ev: threading.Event):
+def commands_watcher(db, machine_id: str, jobs_cache: JobsCache, stop_ev: threading.Event, notifier: Optional[NotificationManager] = None):
     last_seen = datetime.now(timezone.utc) - timedelta(seconds=1)
     while not stop_ev.is_set():
         try:
@@ -420,6 +536,8 @@ def commands_watcher(db, machine_id: str, jobs_cache: JobsCache, stop_ev: thread
                     CFG = load_config()
                     setup_timezone()
                     jobs_cache.reload()
+                    if notifier:
+                        notifier.reload()
                     if USE_RICH:
                         console.print("[green]✓[/green] Config reloaded")
                     else:
@@ -592,20 +710,23 @@ def run_http_with_retry_with_progress(step: Dict[str,Any], defaults: Dict[str,An
     attempts = 0
     last_info = {}
     total_start = time.time()
-    
+
     while True:
         attempts += 1
         start = time.time()
-        
+
         if attempts > 1:
             print_action_progress(action_name, "retrying", int((time.time()-total_start)*1000), attempts, retries+1)
         else:
             print_action_progress(action_name, "running", 0)
-        
+
+        resp = None
+        scraper = None
+
         try:
             use_curl = step.get("use_curl", False)
             use_cloudscraper = step.get("use_cloudscraper", False) or "render.com" in url.lower()
-            
+
             if use_curl and method == "GET":
                 resp = execute_curl_request(url, headers, params, timeout, retries, delay)
             elif USE_CLOUDSCRAPER and use_cloudscraper:
@@ -614,47 +735,60 @@ def run_http_with_retry_with_progress(step: Dict[str,Any], defaults: Dict[str,An
                     scraper.headers[k] = v
                 kwargs = dict(params=params, timeout=timeout, verify=get_ssl_verify_path())
                 if method in ("POST","PUT","PATCH","DELETE"):
-                    if isinstance(body, (dict, list)): kwargs["json"]=body
-                    elif body is not None: kwargs["data"]=body
+                    if isinstance(body, (dict, list)):
+                        kwargs["json"] = body
+                    elif body is not None:
+                        kwargs["data"] = body
                 resp = scraper.request(method, url, **kwargs)
             else:
                 kwargs = dict(headers=headers, params=params, timeout=timeout, verify=get_ssl_verify_path())
                 if method in ("POST","PUT","PATCH","DELETE"):
-                    if isinstance(body, (dict, list)): kwargs["json"]=body
-                    elif body is not None: kwargs["data"]=body
-                resp = requests.request(method, url, **kwargs)
-                
+                    if isinstance(body, (dict, list)):
+                        kwargs["json"] = body
+                    elif body is not None:
+                        kwargs["data"] = body
+                resp = HTTP_SESSION.request(method, url, **kwargs)
+
             elapsed = int((time.time()-start)*1000)
-            
+
+            status_code = getattr(resp, "status_code", 0)
+            resp_text = getattr(resp, "text", "")
             info = {
-                "status_code": resp.status_code,
+                "status_code": status_code,
                 "elapsed_ms": elapsed,
-                "response_sample": (resp.text or "")[:RESP_SAMPLE_MAX]
+                "response_sample": (resp_text or "")[:RESP_SAMPLE_MAX]
             }
-            
-            if 200 <= resp.status_code < 300:
+
+            if 200 <= status_code < 300:
                 info["attempts"] = attempts
                 return "ok", info
             else:
-                last_info = {"error": f"HTTP {resp.status_code}", **info}
-                
+                last_info = {"error": f"HTTP {status_code}", **info}
+
         except Exception as e:
             elapsed = int((time.time()-start)*1000)
             error_msg = str(e)
-            
+
             # SSL 오류 상세 정보
             if "SSL" in error_msg or "certificate" in error_msg.lower():
                 error_msg += f"\n  SSL Verify Path: {get_ssl_verify_path()}"
                 if HAS_CERTIFI:
                     error_msg += f"\n  Certifi Location: {certifi.where()}"
-            
+
             last_info = {"error": error_msg, "elapsed_ms": elapsed,
                          "trace": traceback.format_exc()[:2000]}
-        
+        finally:
+            if scraper is not None:
+                try:
+                    scraper.close()
+                except Exception:
+                    pass
+            safe_close_response(resp)
+
         if attempts > retries:
             last_info["attempts"] = attempts
             return "error", last_info
-        
+
         if delay > 0:
             for i in range(int(delay)):
                 time.sleep(1)
@@ -663,7 +797,7 @@ def run_http_with_retry_with_progress(step: Dict[str,Any], defaults: Dict[str,An
                     console.print(f"    ⏱️ [dim]Waiting {remaining}s before retry...[/dim]", end="\r")
             if delay % 1 > 0:
                 time.sleep(delay % 1)
-        
+
         delay = delay * backoff if backoff > 1 else delay
 
 def run_http_with_retry(step: Dict[str,Any], defaults: Dict[str,Any]) -> Tuple[str, Dict[str,Any]]:
@@ -729,7 +863,8 @@ def execute_actions(db, run_key: Dict[str,Any], job: Dict[str,Any], now_local: d
     return status_overall, steps_log, successful_actions
 
 # -------------------- 분 단위 처리 --------------------
-def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, tick_minute_local: datetime, check_second: int):
+def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, hostname: str,
+                   tick_minute_local: datetime, check_second: int):
     sched_minute_utc = to_utc_minute(tick_minute_local)
     
     if check_second == 0:
@@ -832,25 +967,25 @@ def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, t
         else:
             # v1 하위호환
             step = {
-                "type":"http", "name": j2.get("name","(http)"),
-                "method": j2.get("method","GET"), "url": j2.get("url"),
+                "type": "http", "name": j2.get("name", "(http)"),
+                "method": j2.get("method", "GET"), "url": j2.get("url"),
                 "headers": j2.get("headers"), "params": j2.get("params"), "body": j2.get("body"),
                 "timeout_sec": j2.get("timeout_sec"),
                 "retry": j2.get("retry"),
                 "use_curl": j2.get("use_curl", False),
                 "use_cloudscraper": j2.get("use_cloudscraper", False)
             }
-            
+
             print_action_start(step["name"], 0, 1, step)
-            
-            st, info = run_http_with_retry_with_progress(step, {**CFG.get("http_defaults",{}),
-                                                 "timeout_sec": j2.get("timeout_sec", CFG.get("http_defaults",{}).get("timeout_sec",10)),
-                                                 "retry": j2.get("retry", CFG.get("http_defaults",{}).get("retry",{}))})
-            
+
+            st, info = run_http_with_retry_with_progress(step, {**CFG.get("http_defaults", {}),
+                                                   "timeout_sec": j2.get("timeout_sec", CFG.get("http_defaults", {}).get("timeout_sec", 10)),
+                                                   "retry": j2.get("retry", CFG.get("http_defaults", {}).get("retry", {}))})
+
             print_action_progress(step["name"], st, info.get("elapsed_ms", 0), info.get("attempts", 1))
-            
-            s = {"index":0, "name": step["name"], "status": st}
-            if st=="ok":
+
+            s = {"index": 0, "name": step["name"], "status": st}
+            if st == "ok":
                 s.update({"status_code": info.get("status_code"), "elapsed_ms": info.get("elapsed_ms"),
                           "attempts": info.get("attempts"), "response_sample": info.get("response_sample")})
                 successful_actions = 1
@@ -859,14 +994,31 @@ def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, t
                           "attempts": info.get("attempts"), "status_code": info.get("status_code")})
                 successful_actions = 0
             db.job_runs.update_one(run_key, {"$push": {"steps": s}})
-            status = "ok" if st=="ok" else "error"
+            status = "ok" if st == "ok" else "error"
             total_actions = 1
+            steps = [s]
 
         end_utc = datetime.now(timezone.utc)
         db.job_runs.update_one(run_key, {"$set": {"start_at": start_utc, "end_at": end_utc, "status": status}})
         elapsed = int((end_utc - start_utc).total_seconds() * 1000)
         print_job_result(j2.get('name', 'Unknown'), status, elapsed, total_actions, successful_actions)
-    
+        if NOTIFIER:
+            try:
+                NOTIFIER.notify_job_result(
+                    job_name=j2.get('name', 'Unknown'),
+                    status=status,
+                    elapsed_ms=elapsed,
+                    scheduled_local=tick_minute_local,
+                    machine_id=machine_id,
+                    hostname=hostname,
+                    serial=my_serial,
+                    steps=steps,
+                    total_actions=total_actions,
+                    successful_actions=successful_actions
+                )
+            except Exception as notify_err:
+                print(f"[notify] Error while sending Telegram message: {notify_err}", file=sys.stderr)
+
     # 작업 완료 후 머신 상태 반환 (재확인 시점에서 받은 정보)
     if check_second > 0 and isinstance(check_second, tuple):
         return (check_second[1], check_second[2])  # online_count, total_count
@@ -1124,6 +1276,8 @@ def agent_main():
     hostname = socket.gethostname()
     db = get_db()
     my_serial = get_or_assign_serial(db, machine_id, hostname)
+    global NOTIFIER
+    NOTIFIER = NotificationManager(db)
     
     # 실제 타임존 정보 표시
     tz_display = f"{CFG.get('tz')} (configured)"
@@ -1148,7 +1302,7 @@ def agent_main():
 
     jobs_cache = JobsCache(db)
     stop_ev = threading.Event()
-    t = threading.Thread(target=commands_watcher, args=(db, machine_id, jobs_cache, stop_ev), daemon=True)
+    t = threading.Thread(target=commands_watcher, args=(db, machine_id, jobs_cache, stop_ev, NOTIFIER), daemon=True)
     t.start()
 
     def handle_sig(sig, frame):
@@ -1207,7 +1361,7 @@ def agent_main():
             show_countdown(next_schedule, next_job_name, machine_id, hostname, my_serial)
         
         try:
-            result = process_minute(db, jobs_cache, my_serial, machine_id, next_schedule, 0)
+            result = process_minute(db, jobs_cache, my_serial, machine_id, hostname, next_schedule, 0)
             
             # 결과가 튜플인 경우 (order, online_count, total_count)
             if isinstance(result, tuple) and len(result) == 3:
@@ -1216,7 +1370,7 @@ def agent_main():
                     check_second = (my_order - 1) * OFFSET_STEP_SEC
                     if check_second < 60:
                         time.sleep(check_second)
-                        final_result = process_minute(db, jobs_cache, my_serial, machine_id, next_schedule, 
+                        final_result = process_minute(db, jobs_cache, my_serial, machine_id, hostname, next_schedule,
                                                     (my_order, online_count, total_count))
                         # 작업 완료 후 머신 상태 표시
                         if isinstance(final_result, tuple) and len(final_result) == 2:
