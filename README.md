@@ -1,4 +1,4 @@
-# FleetCron
+# FleetCron V3.0.0
 
 <div align="center">
   <h3>Distributed Cron Job Management System</h3>
@@ -9,14 +9,21 @@
 
 ## 🚀 Features
 
-- **Distributed Execution** - Automatic leader election using serial number assignment (1-N machines)
-- **Smart Failover** - Staggered execution with 10-second offsets to ensure job completion
+- **Distributed Execution** - User-defined order values with automatic minute-level coordination
+- **Smart Failover** - Staggered execution with configurable offsets to ensure job completion
 - **Dynamic Job Management** - Hot reload jobs without restarting agents
 - **HTTP Action Chains** - Sequential execution of multiple HTTP requests with conditional logic
 - **Template System** - Secure secrets management with `{{KEY}}` variable interpolation
 - **Timezone Support** - Configurable timezone with automatic DST handling
 - **Retry Logic** - Configurable retry policies with exponential backoff
 - **Custom Headers** - Full HTTP header customization including User-Agent
+- **Telegram Alerts** - Send silent routine updates and push-based failure notifications
+
+## 🧭 Agent Ordering
+
+- Each agent stores an `order` value in the `machines` collection (mirrored to the legacy `serial` field for compatibility).
+- Update the order at runtime with `db.machines.updateOne({ machine_id: "..." }, { $set: { order: 20 } })`.
+- The next scheduling cycle reloads the latest order automatically—no restart required.
 
 ## 📋 Prerequisites
 
@@ -51,7 +58,9 @@ cp fleetcron.config.example.json fleetcron.config.json
   "mongodb_uri": "mongodb+srv://user:pass@cluster.mongodb.net/",
   "db_name": "fleetcron",
   "tz": "Asia/Seoul",
-  "max_serial": 10,
+  "max_order": 10,
+  "default_order": 9999,
+  "order_field": "order",
   "secrets": {
     "BASE_URL": "https://api.example.com",
     "API_SECRET": "your-secret-key"

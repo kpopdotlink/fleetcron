@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fleetcron agent v2 - FIXED VERSION
+fleetcron agent v3 - dynamic order + Telegram alerts
 - 설정 파일(fleetcron.config.json) 기반
 - 액션 체인(actions) + when 조건 + 리트라이 + 타임아웃
 - 복수 스케줄 지원(jobs.schedules[] 또는 단일 hour/minute)
-- 한 PC 1프로세스, 일련번호(1~N), 앞번호 온라인 감지, 단일 실행 보장
+- 한 PC 1프로세스, 사용자 정의 order 기반 순차 실행, 앞순서 온라인 감지
 
 주요 수정 사항:
 1. 타임존 문제 해결 - pytz 우선 사용, 수동 UTC+9 폴백
@@ -77,6 +77,12 @@ if MISSING_PACKAGES:
 HTTP_SESSION = requests.Session()
 NOTIFIER = None  # type: Optional["NotificationManager"]
 
+# order 설정 (CFG 로드 전 임시 초기값)
+PRIMARY_ORDER_FIELD = "order"
+ORDER_FIELD_ALIASES: List[str] = ["order", "serial"]
+DEFAULT_ORDER_VALUE = 9999
+MAX_ACTIVE_MACHINES = 10
+
 
 def safe_close_response(resp):
     """requests/HTTP 응답 객체를 안전하게 닫는다."""
@@ -122,12 +128,28 @@ def load_config() -> Dict[str, Any]:
     # 기본값
     cfg.setdefault("db_name", "fleetcron")
     cfg.setdefault("tz", "Asia/Seoul")
-    cfg.setdefault("max_serial", 10)
+    cfg.setdefault("max_serial", 10)  # legacy name
+    cfg.setdefault("max_order", cfg.get("max_serial", 10))
+    cfg.setdefault("default_order", 9999)
+    cfg.setdefault("order_field", "order")
     cfg.setdefault("http_defaults", {"timeout_sec": 10, "retry": {"retries": 2, "delay_sec": 3, "backoff": 1.5}})
     cfg.setdefault("secrets", {})
     return cfg
 
 CFG = load_config()
+
+def refresh_order_settings():
+    global PRIMARY_ORDER_FIELD, ORDER_FIELD_ALIASES, DEFAULT_ORDER_VALUE, MAX_ACTIVE_MACHINES
+    PRIMARY_ORDER_FIELD = CFG.get("order_field", "order")
+    ORDER_FIELD_ALIASES = []
+    for key in (PRIMARY_ORDER_FIELD, "order", "serial"):
+        if key not in ORDER_FIELD_ALIASES:
+            ORDER_FIELD_ALIASES.append(key)
+    DEFAULT_ORDER_VALUE = int(CFG.get("default_order", 9999))
+    MAX_ACTIVE_MACHINES = int(CFG.get("max_order", CFG.get("max_serial", 10)))
+
+
+refresh_order_settings()
 
 # -------------------- PyInstaller 환경 수정 --------------------
 def fix_pyinstaller_environment():
@@ -252,7 +274,6 @@ if hasattr(local_now, 'utcoffset') and local_now.utcoffset():
     print(f"UTC offset: {hours:+03d}:{minutes:02d}")
 print("=" * 30 + "\n")
 
-MAX_SERIAL = int(CFG.get("max_serial", 10))
 OFFSET_STEP_SEC = 5  # 원래대로 5초 간격
 RESP_SAMPLE_MAX = 2000
 
@@ -287,6 +308,82 @@ def load_or_create_machine_id() -> str:
         json.dump({"machine_id": mid}, fp)
     return mid
 
+
+def extract_order_value(document: Optional[Dict[str, Any]]) -> int:
+    """머신 문서에서 order 값을 파싱한다."""
+    if not document:
+        return DEFAULT_ORDER_VALUE
+    for key in ORDER_FIELD_ALIASES:
+        if key in document and document[key] is not None:
+            try:
+                return int(document[key])
+            except (ValueError, TypeError):
+                continue
+    return DEFAULT_ORDER_VALUE
+
+
+def build_order_field_map(order_value: int) -> Dict[str, int]:
+    """order 값이 여러 필드(alias)에 동일하게 적용되도록 맵을 만든다."""
+    return {key: order_value for key in ORDER_FIELD_ALIASES}
+
+
+def ensure_machine_record(db, machine_id: str, hostname: str) -> Dict[str, Any]:
+    """머신 정보를 등록하거나 최신화하고 order 필드를 기본값으로 채운다."""
+    now = datetime.now(timezone.utc)
+    set_on_insert = {"machine_id": machine_id, "created_at": now, **build_order_field_map(DEFAULT_ORDER_VALUE)}
+    doc = db.machines.find_one_and_update(
+        {"machine_id": machine_id},
+        {"$set": {"machine_id": machine_id, "hostname": hostname, "last_seen": now},
+         "$setOnInsert": set_on_insert},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+
+    order_value = extract_order_value(doc)
+    desired_fields = build_order_field_map(order_value)
+    diff = {k: v for k, v in desired_fields.items() if doc.get(k) != v}
+    if diff:
+        db.machines.update_one({"_id": doc["_id"]}, {"$set": diff})
+        doc.update(diff)
+    return doc
+
+
+def get_all_machines_sorted(db) -> List[Dict[str, Any]]:
+    """order 값과 machine_id를 기준으로 정렬된 머신 목록을 반환"""
+    projection = {key: 1 for key in ORDER_FIELD_ALIASES}
+    projection.update({"machine_id": 1, "hostname": 1, "last_online_minute": 1})
+    machines = list(db.machines.find({}, projection))
+    machines.sort(key=lambda m: (extract_order_value(m), m.get("machine_id", "")))
+    return machines
+
+
+def get_order_context(db, machine_id: str, hostname: str) -> Tuple[List[Dict[str, Any]], int, int]:
+    """정렬된 머신 목록과 현재 머신의 위치/순서를 반환"""
+    machines = get_all_machines_sorted(db)
+    for idx, machine in enumerate(machines, 1):
+        if machine.get("machine_id") == machine_id:
+            order_value = extract_order_value(machine)
+            desired = build_order_field_map(order_value)
+            diff = {k: v for k, v in desired.items() if machine.get(k) != v}
+            if diff:
+                db.machines.update_one({"machine_id": machine_id}, {"$set": diff})
+                machine.update(diff)
+            return machines, idx, order_value
+
+    ensure_machine_record(db, machine_id, hostname)
+    machines = get_all_machines_sorted(db)
+    for idx, machine in enumerate(machines, 1):
+        if machine.get("machine_id") == machine_id:
+            order_value = extract_order_value(machine)
+            desired = build_order_field_map(order_value)
+            diff = {k: v for k, v in desired.items() if machine.get(k) != v}
+            if diff:
+                db.machines.update_one({"machine_id": machine_id}, {"$set": diff})
+                machine.update(diff)
+            return machines, idx, order_value
+
+    return machines, len(machines) + 1, DEFAULT_ORDER_VALUE
+
 # -------------------- Mongo 연결/인덱스 --------------------
 def get_db():
     uri = CFG.get("mongodb_uri", "")
@@ -295,60 +392,14 @@ def get_db():
     client = MongoClient(uri, appname=APP_NAME)
     db = client[CFG.get("db_name", "fleetcron")]
     db.machines.create_index("machine_id", unique=True)
-    db.machines.create_index("serial")
+    for key in ORDER_FIELD_ALIASES:
+        db.machines.create_index([(key, 1)])
     db.machines.create_index("last_online_minute")
-    db.serials.create_index("serial", unique=True)
     db.jobs.create_index([("enabled",1),("hour",1),("minute",1)])
     db.jobs.create_index([("enabled",1),("schedules.hour",1),("schedules.minute",1)])
     db.job_runs.create_index([("job_id",1),("scheduled_for",1)], unique=True)
     db.commands.create_index([("target",1),("created_at",1)])
     return db
-
-# -------------------- 일련번호 --------------------
-def get_or_assign_serial(db, machine_id: str, hostname: str) -> int:
-    m = db.machines.find_one({"machine_id": machine_id})
-    if m and "serial" in m: return int(m["serial"])
-    now = datetime.now(timezone.utc)
-    assigned = None
-    
-    for s in range(1, MAX_SERIAL+1):
-        try:
-            doc = db.serials.find_one_and_update(
-                {"serial": s, "$or": [{"assigned_to": None}, {"assigned_to": machine_id}]},
-                {"$set": {"assigned_to": machine_id, "assigned_at": now}},
-                upsert=False,
-                return_document=ReturnDocument.AFTER
-            )
-            
-            if doc and doc.get("assigned_to") == machine_id:
-                assigned = s
-                break
-            elif not doc:
-                try:
-                    db.serials.insert_one({
-                        "serial": s,
-                        "assigned_to": machine_id,
-                        "assigned_at": now
-                    })
-                    assigned = s
-                    break
-                except DuplicateKeyError:
-                    continue
-                    
-        except Exception as e:
-            print(f"Serial {s} assignment attempt failed: {e}", file=sys.stderr)
-            continue
-    
-    if not assigned:
-        print(f"Warning: All serial slots 1~{MAX_SERIAL} are occupied. Exiting.", file=sys.stderr)
-        sys.exit(2)
-        
-    db.machines.update_one(
-        {"machine_id": machine_id},
-        {"$set": {"machine_id": machine_id, "hostname": hostname, "serial": assigned, "last_seen": now}},
-        upsert=True
-    )
-    return assigned
 
 # -------------------- 템플릿 해석 --------------------
 def resolve_templates(value):
@@ -487,33 +538,36 @@ class NotificationManager:
             safe_close_response(resp)
 
     def notify_job_result(self, *, job_name: str, status: str, elapsed_ms: int,
-                           scheduled_local: datetime, machine_id: str, hostname: str, serial: int,
+                           scheduled_local: datetime, machine_id: str, hostname: str,
+                           order_value: int, order_position: int,
                            steps: List[Dict[str, Any]], total_actions: int, successful_actions: int) -> None:
         if not self.is_configured():
             return
 
         silent = status == "ok"
-        header = "✅ FleetCron Job Succeeded" if silent else "🚨 FleetCron Job Failed"
+        header = "🟢 FleetCron Job Succeeded" if silent else "🚨 FleetCron Job Failed"
         lines = [header]
-        lines.append(f"Job: {job_name}")
-        lines.append(f"Scheduled: {scheduled_local.strftime('%Y-%m-%d %H:%M (%Z)')}")
-        lines.append(f"Machine: {hostname} (serial #{serial}, id {machine_id[:8]}...)")
-        lines.append(f"Elapsed: {elapsed_ms} ms")
+        lines.append(f"• Job: {job_name}")
+        lines.append(f"• Scheduled: {scheduled_local.strftime('%Y-%m-%d %H:%M (%Z)')}")
+        lines.append(f"• Host: {hostname} (id {machine_id[:8]}...)")
+        lines.append(f"• Order: {order_value} (position #{order_position})")
+        lines.append(f"• Duration: {elapsed_ms} ms")
         if total_actions > 0:
-            lines.append(f"Actions: {successful_actions}/{total_actions} succeeded")
+            lines.append(f"• Actions: {successful_actions}/{total_actions} ok")
 
         if not silent:
-            failure = next((step for step in steps if step.get("status") != "ok" and step.get("status") != "skipped" and step.get("status") != "skipped_when" and step.get("status") != "skipped_unsupported"), None)
+            failure = next((step for step in steps if step.get("status") not in {"ok", "skipped", "skipped_when", "skipped_unsupported"}), None)
             if not failure:
                 failure = next((step for step in steps if step.get("status") == "error"), None)
             if failure:
                 err = failure.get("error") or failure.get("status") or "Unknown error"
                 attempts = failure.get("attempts")
-                lines.append(f"Error: {err}")
+                lines.append(f"• Error: {err}")
                 if attempts:
-                    lines.append(f"Attempts: {attempts}")
+                    lines.append(f"• Attempts: {attempts}")
 
-        self.send_message("\n".join(lines), silent=silent)
+        message = "\n".join(lines)
+        self.send_message(message, silent=silent)
 # -------------------- 명령 폴링 --------------------
 def commands_watcher(db, machine_id: str, jobs_cache: JobsCache, stop_ev: threading.Event, notifier: Optional[NotificationManager] = None):
     last_seen = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -534,6 +588,7 @@ def commands_watcher(db, machine_id: str, jobs_cache: JobsCache, stop_ev: thread
                 elif cmd.get("type") == "reload_config":
                     global CFG, CRON_TZ, ACTUAL_TZ_NAME
                     CFG = load_config()
+                    refresh_order_settings()
                     setup_timezone()
                     jobs_cache.reload()
                     if notifier:
@@ -558,36 +613,15 @@ def update_heartbeat(db, machine_id: str, scheduled_minute_utc: datetime):
     db.machines.update_one({"machine_id": machine_id},
         {"$set": {"last_online_minute": scheduled_minute_utc, "last_seen": now}})
 
-def get_my_fixed_order(db, my_serial: int, machine_id: str) -> int:
-    """전체 머신 중 나의 고정 순번을 반환 (serial + machine_id 정렬)"""
-    # 모든 머신을 serial, machine_id 순으로 정렬
-    all_machines = list(db.machines.find(
-        {},
-        {"serial": 1, "machine_id": 1}
-    ).sort([("serial", 1), ("machine_id", 1)]))
-    
-    # 내 순번 찾기
-    for idx, m in enumerate(all_machines, 1):
-        if m["machine_id"] == machine_id:
-            return idx
-    
-    # 못 찾으면 serial 값을 기본으로 사용
-    return my_serial
-
-def check_earlier_machines_online(db, my_order: int, machine_id: str, scheduled_minute_utc: datetime) -> bool:
+def check_earlier_machines_online(machines_sorted: List[Dict[str, Any]], my_position: int,
+                                   scheduled_minute_utc: datetime) -> bool:
     """내 앞 순번 머신들이 이번 분에 온라인인지 확인"""
-    if my_order <= 1:
+    if my_position <= 1:
         return False
     
-    # 모든 머신을 순서대로 가져옴
-    all_machines = list(db.machines.find(
-        {},
-        {"serial": 1, "machine_id": 1, "last_online_minute": 1}
-    ).sort([("serial", 1), ("machine_id", 1)]))
-    
-    # 내 앞 순번들 확인 (1부터 my_order-1까지)
-    for idx, m in enumerate(all_machines, 1):
-        if idx >= my_order:
+    # 내 앞 순번들 확인 (1부터 my_position-1까지)
+    for idx, m in enumerate(machines_sorted, 1):
+        if idx >= my_position:
             break  # 내 순번에 도달
         
         # 이 머신이 현재 분에 활동했는지 확인
@@ -597,7 +631,7 @@ def check_earlier_machines_online(db, my_order: int, machine_id: str, scheduled_
     return False  # 앞 순번들이 모두 죽었거나 활동 안함
 
 # -------------------- 클레임 --------------------
-def claim_job_run(db, job, scheduled_minute_utc, machine_id, my_serial):
+def claim_job_run(db, job, scheduled_minute_utc, machine_id, order_value: int, order_position: int):
     now = datetime.now(timezone.utc)
     try:
         doc = db.job_runs.find_one_and_update(
@@ -605,11 +639,16 @@ def claim_job_run(db, job, scheduled_minute_utc, machine_id, my_serial):
                 "job_id": job["_id"], "scheduled_for": scheduled_minute_utc,
                 "$or": [{"claimed_by": None}, {"claimed_by": machine_id}]
             },
-            {"$setOnInsert":{"job_id":job["_id"],"scheduled_for":scheduled_minute_utc},
-             "$set":{"claimed_by":machine_id,"claimed_at":now,"executed_by_serial":my_serial,"status":"running","steps":[]}},
+            {"$setOnInsert": {"job_id": job["_id"], "scheduled_for": scheduled_minute_utc},
+             "$set": {"claimed_by": machine_id,
+                       "claimed_at": now,
+                       "executed_order_value": order_value,
+                       "executed_order_position": order_position,
+                       "status": "running",
+                       "steps": []}},
             upsert=True, return_document=ReturnDocument.AFTER
         )
-        return doc and doc.get("claimed_by")==machine_id
+        return doc and doc.get("claimed_by") == machine_id
     except DuplicateKeyError:
         return False
     except PyMongoError as e:
@@ -863,74 +902,71 @@ def execute_actions(db, run_key: Dict[str,Any], job: Dict[str,Any], now_local: d
     return status_overall, steps_log, successful_actions
 
 # -------------------- 분 단위 처리 --------------------
-def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, hostname: str,
-                   tick_minute_local: datetime, check_second: int):
+def process_minute(db, jobs_cache: JobsCache, machine_id: str, hostname: str,
+                   tick_minute_local: datetime, check_marker):
     sched_minute_utc = to_utc_minute(tick_minute_local)
-    
-    if check_second == 0:
-        # 1. 모든 머신이 동시에 heartbeat 업데이트 (중요!)
+
+    if check_marker == 0:
         update_heartbeat(db, machine_id, sched_minute_utc)
-        
-        # 2. 내 고정 순번 확인 (serial + machine_id 정렬)
-        my_order = get_my_fixed_order(db, my_serial, machine_id)
-        
-        # 모든 머신 상태 확인 (나중에 표시용)
-        all_machines = list(db.machines.find(
-            {},
-            {"serial": 1, "machine_id": 1, "last_online_minute": 1}
-        ).sort([("serial", 1), ("machine_id", 1)]))
-        
-        online_count = sum(1 for m in all_machines if m.get("last_online_minute") == sched_minute_utc)
-        total_count = len(all_machines)
-        
-        # 3. Jobs 리로드
         jobs_cache.reload()
-        
-        wait_seconds = (my_order - 1) * OFFSET_STEP_SEC
-        
+
+        machines, my_position, my_order_value = get_order_context(db, machine_id, hostname)
+        total_count = len(machines)
+        online_count = sum(1 for m in machines if m.get("last_online_minute") == sched_minute_utc)
+
+        wait_seconds = max(0, (my_position - 1) * OFFSET_STEP_SEC)
+
         if USE_RICH:
-            console.print(f"\n[bold cyan]⏰ {tick_minute_local:%H:%M}[/bold cyan] - Serial #{my_serial} (Order #{my_order}/{total_count})")
+            console.print(
+                f"\n[bold cyan]⏰ {tick_minute_local:%H:%M}[/bold cyan] - "
+                f"Order value {my_order_value} (position #{my_position}/{total_count})"
+            )
         else:
-            print(f"\n⏰ {tick_minute_local:%H:%M} - Serial #{my_serial} (Order #{my_order}/{total_count})")
-        
-        # 4. 순번 1이면 즉시 실행, 아니면 대기
-        if my_order == 1:
-            # 바로 실행
-            pass
-        else:
-            # 카운트다운 표시하면서 대기
-            show_serial_wait_countdown(wait_seconds)
-            return (my_order, online_count, total_count)  # 튜플로 상태 정보 반환
-    
+            print(
+                f"\n⏰ {tick_minute_local:%H:%M} - Order value {my_order_value} "
+                f"(position #{my_position}/{total_count})"
+            )
+
+        if MAX_ACTIVE_MACHINES > 0 and my_position > MAX_ACTIVE_MACHINES:
+            msg = "  ⚠️ Reached active agent limit; skipping this minute"
+            console.print(msg) if USE_RICH else print(msg)
+            return (online_count, total_count)
+
+        if wait_seconds > 0:
+            show_order_wait_countdown(wait_seconds)
+            return (my_position, my_order_value, online_count, total_count)
+
     else:
-        # 재확인 시점 (5초, 10초, 15초...)
-        # 튜플로 전달된 경우 언패킹
-        if isinstance(check_second, tuple):
-            my_order, online_count, total_count = check_second[0], check_second[1], check_second[2]
-            check_second = (my_order - 1) * OFFSET_STEP_SEC
-        else:
-            my_order = get_my_fixed_order(db, my_serial, machine_id)
-            online_count = 0
-            total_count = 0
-        
+        machines, my_position, my_order_value = get_order_context(db, machine_id, hostname)
+        total_count = len(machines)
+        online_count = sum(1 for m in machines if m.get("last_online_minute") == sched_minute_utc)
+        check_second = (my_position - 1) * OFFSET_STEP_SEC if isinstance(check_marker, tuple) else int(check_marker)
+
         if USE_RICH:
-            console.print(f"\n[bold cyan]⏰ {tick_minute_local:%H:%M}:{check_second:02d}[/bold cyan] - Checking order #{my_order}")
+            console.print(
+                f"\n[bold cyan]⏰ {tick_minute_local:%H:%M}:{check_second:02d}[/bold cyan] "
+                f"- Rechecking order value {my_order_value} (position #{my_position})"
+            )
         else:
-            print(f"\n⏰ {tick_minute_local:%H:%M}:{check_second:02d} - Checking order #{my_order}")
-        
-        # 내 앞 순번들이 살아있는지 확인
-        if check_earlier_machines_online(db, my_order, machine_id, sched_minute_utc):
-            if USE_RICH:
-                console.print(f"  [dim]Earlier machine is online, skipping[/dim]")
-            else:
-                print(f"  Earlier machine is online, skipping")
-            return (online_count, total_count)  # 머신 상태 정보 반환
-        
-        # 앞 순번들이 모두 죽었음 - 내가 실행
+            print(
+                f"\n⏰ {tick_minute_local:%H:%M}:{check_second:02d} - "
+                f"Rechecking order value {my_order_value} (position #{my_position})"
+            )
+
+        if MAX_ACTIVE_MACHINES > 0 and my_position > MAX_ACTIVE_MACHINES:
+            msg = "  ⚠️ Beyond active agent limit; skipping"
+            console.print(msg) if USE_RICH else print(msg)
+            return (online_count, total_count)
+
+        if check_earlier_machines_online(machines, my_position, sched_minute_utc):
+            msg = "  Earlier machine reported in this minute; standing down"
+            console.print(f"[dim]{msg}[/dim]") if USE_RICH else print(msg)
+            return (online_count, total_count)
+
         if USE_RICH:
-            console.print(f"  [green]No earlier machines online, executing![/green]")
+            console.print("  [green]No earlier machines online, executing![/green]")
         else:
-            print(f"  No earlier machines online, executing!")
+            print("  No earlier machines online, executing!")
 
     hh, mm = tick_minute_local.hour, tick_minute_local.minute
     jobs = jobs_cache.list_for(hh, mm)
@@ -941,46 +977,45 @@ def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, h
             print(f"No jobs at {tick_minute_local:%H:%M}")
         return
 
-    for j in jobs:
-        j2 = db.jobs.find_one({"_id": j["_id"], "enabled": True})
-        if not j2:
+    for job in jobs:
+        job_doc = db.jobs.find_one({"_id": job["_id"], "enabled": True})
+        if not job_doc:
             if USE_RICH:
-                console.print(f"  [dim]• {j.get('name','Unknown')}: Disabled/deleted[/dim]")
+                console.print(f"  [dim]• {job.get('name','Unknown')}: Disabled/deleted[/dim]")
             else:
-                print(f"  • {j.get('name','Unknown')}: Disabled/deleted")
-            continue
-            
-        if not claim_job_run(db, j2, sched_minute_utc, machine_id, my_serial):
-            if USE_RICH:
-                console.print(f"  [dim]• {j2.get('name','Unknown')}: Already claimed[/dim]")
-            else:
-                print(f"  • {j2.get('name','Unknown')}: Already claimed")
+                print(f"  • {job.get('name','Unknown')}: Disabled/deleted")
             continue
 
-        print_job_start(j2.get('name', 'Unknown'), my_serial, j2)
+        if not claim_job_run(db, job_doc, sched_minute_utc, machine_id, my_order_value, my_position):
+            if USE_RICH:
+                console.print(f"  [dim]• {job_doc.get('name','Unknown')}: Already claimed[/dim]")
+            else:
+                print(f"  • {job_doc.get('name','Unknown')}: Already claimed")
+            continue
+
+        print_job_start(job_doc.get('name', 'Unknown'), my_order_value, my_position, job_doc)
         start_utc = datetime.now(timezone.utc)
-        run_key = {"job_id": j2["_id"], "scheduled_for": sched_minute_utc}
-        
-        if j2.get("actions"):
-            status, steps, successful_actions = execute_actions(db, run_key, j2, tick_minute_local, {})
-            total_actions = len(j2.get("actions", []))
+        run_key = {"job_id": job_doc["_id"], "scheduled_for": sched_minute_utc}
+
+        if job_doc.get("actions"):
+            status, steps, successful_actions = execute_actions(db, run_key, job_doc, tick_minute_local, {})
+            total_actions = len(job_doc.get("actions", []))
         else:
-            # v1 하위호환
             step = {
-                "type": "http", "name": j2.get("name", "(http)"),
-                "method": j2.get("method", "GET"), "url": j2.get("url"),
-                "headers": j2.get("headers"), "params": j2.get("params"), "body": j2.get("body"),
-                "timeout_sec": j2.get("timeout_sec"),
-                "retry": j2.get("retry"),
-                "use_curl": j2.get("use_curl", False),
-                "use_cloudscraper": j2.get("use_cloudscraper", False)
+                "type": "http", "name": job_doc.get("name", "(http)"),
+                "method": job_doc.get("method", "GET"), "url": job_doc.get("url"),
+                "headers": job_doc.get("headers"), "params": job_doc.get("params"), "body": job_doc.get("body"),
+                "timeout_sec": job_doc.get("timeout_sec"),
+                "retry": job_doc.get("retry"),
+                "use_curl": job_doc.get("use_curl", False),
+                "use_cloudscraper": job_doc.get("use_cloudscraper", False)
             }
 
             print_action_start(step["name"], 0, 1, step)
 
             st, info = run_http_with_retry_with_progress(step, {**CFG.get("http_defaults", {}),
-                                                   "timeout_sec": j2.get("timeout_sec", CFG.get("http_defaults", {}).get("timeout_sec", 10)),
-                                                   "retry": j2.get("retry", CFG.get("http_defaults", {}).get("retry", {}))})
+                                                   "timeout_sec": job_doc.get("timeout_sec", CFG.get("http_defaults", {}).get("timeout_sec", 10)),
+                                                   "retry": job_doc.get("retry", CFG.get("http_defaults", {}).get("retry", {}))})
 
             print_action_progress(step["name"], st, info.get("elapsed_ms", 0), info.get("attempts", 1))
 
@@ -1001,17 +1036,18 @@ def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, h
         end_utc = datetime.now(timezone.utc)
         db.job_runs.update_one(run_key, {"$set": {"start_at": start_utc, "end_at": end_utc, "status": status}})
         elapsed = int((end_utc - start_utc).total_seconds() * 1000)
-        print_job_result(j2.get('name', 'Unknown'), status, elapsed, total_actions, successful_actions)
+        print_job_result(job_doc.get('name', 'Unknown'), status, elapsed, total_actions, successful_actions)
         if NOTIFIER:
             try:
                 NOTIFIER.notify_job_result(
-                    job_name=j2.get('name', 'Unknown'),
+                    job_name=job_doc.get('name', 'Unknown'),
                     status=status,
                     elapsed_ms=elapsed,
                     scheduled_local=tick_minute_local,
                     machine_id=machine_id,
                     hostname=hostname,
-                    serial=my_serial,
+                    order_value=my_order_value,
+                    order_position=my_position,
                     steps=steps,
                     total_actions=total_actions,
                     successful_actions=successful_actions
@@ -1019,16 +1055,11 @@ def process_minute(db, jobs_cache: JobsCache, my_serial: int, machine_id: str, h
             except Exception as notify_err:
                 print(f"[notify] Error while sending Telegram message: {notify_err}", file=sys.stderr)
 
-    # 작업 완료 후 머신 상태 반환 (재확인 시점에서 받은 정보)
-    if check_second > 0 and isinstance(check_second, tuple):
-        return (check_second[1], check_second[2])  # online_count, total_count
-    elif check_second == 0:
-        # 첫 실행 시점에서 계산한 정보가 있으면 반환
-        return (online_count, total_count)
+    return (online_count, total_count)
 
 # -------------------- 예쁜 출력 함수들 --------------------
-def show_serial_wait_countdown(wait_seconds: int):
-    """시리얼 대기 시간 카운트다운 표시"""
+def show_order_wait_countdown(wait_seconds: int):
+    """order 대기 시간 카운트다운 표시"""
     if not USE_RICH:
         print(f"  ⏳ Waiting {wait_seconds}s to check...")
         return
@@ -1056,7 +1087,7 @@ def show_serial_wait_countdown(wait_seconds: int):
             live.update(text)
             time.sleep(0.5)
 
-def show_countdown(target_time: datetime, next_job_name: str = "Next job", machine_id: str = "", hostname: str = "", serial: int = 0):
+def show_countdown(target_time: datetime, next_job_name: str = "Next job", machine_id: str = "", hostname: str = "", order_value: int = 0):
     """실시간 카운트다운 타이머 표시"""
     if not USE_RICH:
         sleep_sec = (target_time - datetime.now(target_time.tzinfo)).total_seconds()
@@ -1083,7 +1114,7 @@ def show_countdown(target_time: datetime, next_job_name: str = "Next job", machi
             header_text = Text()
             header_text.append("🤖 FleetCron Agent ", style="bold cyan")
             header_text.append(f"[{hostname}]", style="yellow")
-            header_text.append(f" Serial #{serial}", style="green")
+            header_text.append(f" Order {order_value}", style="green")
             layout["header"].update(Panel(header_text, title="[bold blue]System Info[/bold blue]"))
             
             timer_text = Text(justify="center")
@@ -1168,7 +1199,7 @@ def show_long_wait_countdown(wait_seconds: int, next_time: datetime, next_job_na
             live.update(layout)
             time.sleep(1)
 
-def print_job_start(job_name: str, my_order: int, job_config: Dict[str, Any] = None):
+def print_job_start(job_name: str, order_value: int, order_position: int, job_config: Dict[str, Any] = None):
     """작업 시작 시 상세 정보 출력"""
     if USE_RICH:
         table = Table(show_header=True, header_style="bold cyan", box=None)
@@ -1176,7 +1207,8 @@ def print_job_start(job_name: str, my_order: int, job_config: Dict[str, Any] = N
         table.add_column("Value", style="white")
         
         table.add_row("📋 Job Name", f"[bold]{job_name}[/bold]")
-        table.add_row("🎯 Execution Order", f"#{my_order}")
+        table.add_row("🎯 Order Value", f"{order_value}")
+        table.add_row("📐 Position", f"#{order_position}")
         
         if job_config:
             timeout = job_config.get("timeout_sec", CFG.get("http_defaults", {}).get("timeout_sec", 30))
@@ -1197,7 +1229,7 @@ def print_job_start(job_name: str, my_order: int, job_config: Dict[str, Any] = N
         console.print("\n")
         console.print(Panel(table, title="[bold green]🚀 Starting Job[/bold green]", border_style="green"))
     else:
-        print(f"\n🚀 Starting: {job_name} (Order #{my_order})")
+        print(f"\n🚀 Starting: {job_name} (order {order_value}, position #{order_position})")
         if job_config:
             timeout = job_config.get("timeout_sec", 30)
             retry = job_config.get("retry", {})
@@ -1275,7 +1307,8 @@ def agent_main():
     machine_id = load_or_create_machine_id()
     hostname = socket.gethostname()
     db = get_db()
-    my_serial = get_or_assign_serial(db, machine_id, hostname)
+    machine_doc = ensure_machine_record(db, machine_id, hostname)
+    initial_order_value = extract_order_value(machine_doc)
     global NOTIFIER
     NOTIFIER = NotificationManager(db)
     
@@ -1289,7 +1322,7 @@ def agent_main():
             f"[bold cyan]🚀 FleetCron Agent Started[/bold cyan]\n\n"
             f"[yellow]Machine ID:[/yellow] {machine_id[:12]}...\n"
             f"[yellow]Hostname:[/yellow] {hostname}\n"
-            f"[yellow]Serial:[/yellow] #{my_serial}\n"
+            f"[yellow]Order Value:[/yellow] {initial_order_value}\n"
             f"[yellow]Timezone:[/yellow] {tz_display}\n"
             f"[yellow]Offset Step:[/yellow] {OFFSET_STEP_SEC}s\n"
             f"[yellow]SSL:[/yellow] {'✓ certifi' if HAS_CERTIFI else '⚠️ system CA'}",
@@ -1298,7 +1331,7 @@ def agent_main():
         )
         console.print(start_panel)
     else:
-        print(f"🚀 Started: machine_id={machine_id}, host={hostname}, serial={my_serial}, tz={tz_display}, offset={OFFSET_STEP_SEC}s")
+        print(f"🚀 Started: machine_id={machine_id}, host={hostname}, order={initial_order_value}, tz={tz_display}, offset={OFFSET_STEP_SEC}s")
 
     jobs_cache = JobsCache(db)
     stop_ev = threading.Event()
@@ -1357,41 +1390,38 @@ def agent_main():
         if sleep_sec > 0:
             next_jobs = jobs_cache.list_for(next_schedule.hour, next_schedule.minute)
             next_job_name = next_jobs[0].get('name', 'Unknown Job') if next_jobs else 'Unknown Job'
-            
-            show_countdown(next_schedule, next_job_name, machine_id, hostname, my_serial)
-        
+            current_doc = db.machines.find_one({"machine_id": machine_id})
+            current_order_value = extract_order_value(current_doc)
+            show_countdown(next_schedule, next_job_name, machine_id, hostname, current_order_value)
+
         try:
-            result = process_minute(db, jobs_cache, my_serial, machine_id, hostname, next_schedule, 0)
-            
-            # 결과가 튜플인 경우 (order, online_count, total_count)
-            if isinstance(result, tuple) and len(result) == 3:
-                my_order, online_count, total_count = result
-                if my_order > 1:
-                    check_second = (my_order - 1) * OFFSET_STEP_SEC
-                    if check_second < 60:
-                        time.sleep(check_second)
-                        final_result = process_minute(db, jobs_cache, my_serial, machine_id, hostname, next_schedule,
-                                                    (my_order, online_count, total_count))
-                        # 작업 완료 후 머신 상태 표시
-                        if isinstance(final_result, tuple) and len(final_result) == 2:
-                            online, total = final_result
-                            if USE_RICH:
-                                console.print(f"\n[dim]🖥️  Machines at execution: {online}/{total} online[/dim]")
-                            else:
-                                print(f"\n🖥️  Machines: {online}/{total} online")
-                else:
-                    # 순번 1인 경우도 머신 상태 표시
+            result = process_minute(db, jobs_cache, machine_id, hostname, next_schedule, 0)
+
+            if isinstance(result, tuple):
+                if len(result) == 4:
+                    my_position, my_order_value, online_count, total_count = result
+                    final_result = process_minute(
+                        db, jobs_cache, machine_id, hostname, next_schedule,
+                        (my_position, my_order_value, online_count, total_count)
+                    )
+                    if isinstance(final_result, tuple) and len(final_result) == 2:
+                        online, total = final_result
+                        if USE_RICH:
+                            console.print(f"\n[dim]🖥️  Machines at execution: {online}/{total} online[/dim]")
+                        else:
+                            print(f"\n🖥️  Machines: {online}/{total} online")
+                    else:
+                        online_count, total_count = final_result or (online_count, total_count)
+                        if USE_RICH:
+                            console.print(f"\n[dim]🖥️  Machines at execution: {online_count}/{total_count} online[/dim]")
+                        else:
+                            print(f"\n🖥️  Machines: {online_count}/{total_count} online")
+                elif len(result) == 2:
+                    online_count, total_count = result
                     if USE_RICH:
                         console.print(f"\n[dim]🖥️  Machines at execution: {online_count}/{total_count} online[/dim]")
                     else:
                         print(f"\n🖥️  Machines: {online_count}/{total_count} online")
-            elif isinstance(result, tuple) and len(result) == 2:
-                # 작업 완료 후 반환된 머신 상태
-                online_count, total_count = result
-                if USE_RICH:
-                    console.print(f"\n[dim]🖥️  Machines at execution: {online_count}/{total_count} online[/dim]")
-                else:
-                    print(f"\n🖥️  Machines: {online_count}/{total_count} online")
         except Exception as e:
             print("[loop] 오류:", e, file=sys.stderr)
             traceback.print_exc()

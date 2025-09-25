@@ -2,6 +2,9 @@
   "mongodb_uri": "mongodb://localhost:27017",
   "db_name": "fleetcron",
   "tz": "Asia/Seoul",
+  "max_order": 10,
+  "default_order": 9999,
+  "order_field": "order",
   "http_defaults": {
     "timeout_sec": 30,
     "retry": {
