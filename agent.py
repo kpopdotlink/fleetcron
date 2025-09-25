@@ -333,7 +333,7 @@ def ensure_machine_record(db, machine_id: str, hostname: str) -> Dict[str, Any]:
     set_on_insert = {"machine_id": machine_id, "created_at": now, **build_order_field_map(DEFAULT_ORDER_VALUE)}
     doc = db.machines.find_one_and_update(
         {"machine_id": machine_id},
-        {"$set": {"machine_id": machine_id, "hostname": hostname, "last_seen": now},
+        {"$set": {"hostname": hostname, "last_seen": now},
          "$setOnInsert": set_on_insert},
         upsert=True,
         return_document=ReturnDocument.AFTER
